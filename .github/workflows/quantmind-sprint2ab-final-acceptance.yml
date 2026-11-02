@@ -1,0 +1,218 @@
+name: QuantMind Sprint-2A2B Final Acceptance
+
+on:
+  push:
+    branches:
+      - feature/sprint2ab-v1.4.1
+  pull_request:
+    branches:
+      - master
+    paths:
+      - 'backend/**'
+      - 'data/**'
+      - 'scripts/**'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sprint2ab-final-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ruff:
+    name: G1 Ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Ruff
+        run: python -m pip install --upgrade pip ruff
+      - name: Ruff full backend/scripts
+        run: ruff check backend scripts
+
+  postgres16:
+    name: G3 PostgreSQL 16 + concurrency
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: '5432'
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PYTHONPATH: .
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install acceptance dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest pytest-asyncio sqlalchemy 'psycopg[binary]' asyncpg
+      - name: Verify PostgreSQL 16
+        run: |
+          psql --version
+          psql -Atqc 'show server_version;'
+      - name: Fresh and upgrade schema convergence
+        run: |
+          set -euo pipefail
+          FRESH_DB=qm_s2ab_fresh
+          UPGRADE_DB=qm_s2ab_upgrade
+          dropdb --if-exists "$FRESH_DB" || true
+          dropdb --if-exists "$UPGRADE_DB" || true
+          createdb "$FRESH_DB"
+          createdb "$UPGRADE_DB"
+
+          psql -v ON_ERROR_STOP=1 -d "$FRESH_DB" -f backend/shared/db_init.sql
+          for f in \
+            data/db_init_accounting_v1.2.full_fragment.sql \
+            data/db_init_backtest_v2_fragment.sql \
+            data/db_init_sprint2ab_v2.0.2_fragment.sql; do
+            if [ -f "$f" ]; then
+              psql -v ON_ERROR_STOP=1 -d "$FRESH_DB" -f "$f"
+            fi
+          done
+
+          git show 0ce342af1ce32b5ac3dd033134903de6d036fb36:backend/shared/db_init.sql > /tmp/qm_db_init_baseline.sql
+          psql -v ON_ERROR_STOP=1 -d "$UPGRADE_DB" -f /tmp/qm_db_init_baseline.sql
+          while IFS= read -r f; do
+            echo "Applying $f"
+            psql -v ON_ERROR_STOP=1 -d "$UPGRADE_DB" -f "$f"
+          done < <(find data -maxdepth 1 -type f -name 'upgrade_v*.sql' ! -name '*repair*' | sort -V)
+
+          SCHEMA_FRESH_URL="postgresql://postgres:postgres@127.0.0.1:5432/$FRESH_DB" \
+          SCHEMA_UPGRADE_URL="postgresql://postgres:postgres@127.0.0.1:5432/$UPGRADE_DB" \
+          python scripts/ops/ci/schema_convergence_gate.py
+      - name: Real PostgreSQL concurrency and idempotency
+        env:
+          SPRINT2AB_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/qm_s2ab_fresh
+        run: |
+          python -m pytest -q \
+            backend/tests/platform_foundation/sprint2ab/test_postgres_third_batch_acceptance.py \
+            --disable-warnings
+
+  paper-e2e:
+    name: Gateway 8000 to Engine 8001 Paper E2E
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: quantmind
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d quantmind"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PYTHONPATH: .
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/quantmind
+      POSTGRES_URL: postgresql://postgres:postgres@127.0.0.1:5432/quantmind
+      REDIS_URL: redis://127.0.0.1:6379/0
+      QM_TRADING_V2_PAPER_API: 'true'
+      QM_GATEWAY_URL: http://127.0.0.1:8000
+      QM_ENGINE_URL: http://127.0.0.1:8001
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f backend/requirements.txt ]; then python -m pip install -r backend/requirements.txt; fi
+          if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi
+          python -m pip install uvicorn httpx pytest pytest-asyncio sqlalchemy 'psycopg[binary]' asyncpg redis fastapi
+      - name: Initialize database
+        run: |
+          psql -v ON_ERROR_STOP=1 -d quantmind -f backend/shared/db_init.sql
+          for f in \
+            data/db_init_accounting_v1.2.full_fragment.sql \
+            data/db_init_backtest_v2_fragment.sql \
+            data/db_init_sprint2ab_v2.0.2_fragment.sql; do
+            if [ -f "$f" ]; then psql -v ON_ERROR_STOP=1 -d quantmind -f "$f"; fi
+          done
+      - name: Start Engine and Gateway
+        run: |
+          set -euo pipefail
+          nohup python -m uvicorn backend.services.engine.main:app --host 127.0.0.1 --port 8001 > /tmp/engine.log 2>&1 &
+          echo $! > /tmp/engine.pid
+          nohup python -m uvicorn backend.services.api.main:app --host 127.0.0.1 --port 8000 > /tmp/gateway.log 2>&1 &
+          echo $! > /tmp/gateway.pid
+          python - <<'PY'
+          import time, urllib.request
+          targets=['http://127.0.0.1:8001/health','http://127.0.0.1:8000/health']
+          deadline=time.time()+60
+          pending=set(targets)
+          while pending and time.time()<deadline:
+              for url in list(pending):
+                  try:
+                      with urllib.request.urlopen(url, timeout=2) as r:
+                          if r.status < 500:
+                              pending.remove(url)
+                  except Exception:
+                      pass
+              time.sleep(1)
+          if pending:
+              raise SystemExit('services not ready: '+','.join(sorted(pending)))
+          PY
+      - name: Gateway to Engine Paper E2E
+        run: python scripts/ops/acceptance/sprint2ab_gateway_paper_e2e.py
+      - name: Dump service logs on failure
+        if: failure()
+        run: |
+          echo '=== engine.log ==='
+          cat /tmp/engine.log || true
+          echo '=== gateway.log ==='
+          cat /tmp/gateway.log || true
+
+  acceptance-summary:
+    name: Mandatory acceptance summary
+    if: always()
+    needs: [ruff, postgres16, paper-e2e]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all mandatory jobs pass
+        env:
+          RUFF_RESULT: ${{ needs.ruff.result }}
+          PG_RESULT: ${{ needs.postgres16.result }}
+          E2E_RESULT: ${{ needs.paper-e2e.result }}
+        run: |
+          echo "Ruff=$RUFF_RESULT PostgreSQL=$PG_RESULT PaperE2E=$E2E_RESULT"
+          test "$RUFF_RESULT" = success
+          test "$PG_RESULT" = success
+          test "$E2E_RESULT" = success
+          echo 'Sprint-2A/2B FINAL ENVIRONMENT ACCEPTANCE: PASS'
